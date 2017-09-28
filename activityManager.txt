@@ -1,0 +1,100 @@
+在android中，Activity是四大组件中比较重要的一个（当然其他的也比较重要），那么android中是怎样管理这些activity的？应用的进程和主线程是怎么创建的，应用的消息循环又是在什么时候创建的？在这篇文章中将详细介绍：
+
+ 
+
+先来看下涉及到的类，通过以下类图对整体先有个大概的印象：
+
+ 
+
+
+
+ 
+
+ActivityThread:
+
+ActivityThread主要用来启动应用程序的主线程，并且管理在应用端跟用户打交道的activity。在应用端的activity信息全部被存储在ActivityThread的成员变量mActivities中。
+
+ 
+
+[java] view plain copy
+ 
+final HashMap<IBinder, ActivityRecord> mActivities= new  HashMap<IBinder, ActivityRecord>();   
+ 
+
+也就是说，在mActivities中，记录了应用程序创建的所有activity实例记录，对应的是ActivityRecord。
+
+ActivityThread是怎么启动应用程序的呢？ActivityThread中有一个main函数，在这个里面，将启动应用程序并建立消息循环。在之前也介绍过，系统会为主线程自动创建消息循环。
+
+  
+
+[java] view plain copy
+ 
+/*** 应用程序的启动入口 . ，主线程在启动的时候系统会自动建立消息循环机制。*/public static final void main(String[] args) {  SamplingProfilerIntegration.start();  Process.setArgV0("<pre-initialized>");  Looper.prepareMainLooper();  ActivityThread thread = new ActivityThread();  thread.attach(false);  Looper.loop();    if (Process.supportsProcesses()) {     throw new RuntimeException("Main thread loop unexpectedly exited");   }   thread.detach();   String name = (thread.mInitialApplication != null)            ? thread.mInitialApplication.getPackageName()            : "<unknown>";Slog.i(TAG, "Main thread of " + name + " is now exiting");    }  
+ 
+
+在建立消息循环之前，会通过thread.attach(false)来初始化应用程序的运行环境，并建立activityThread和ActivityManagerService之间的桥mAppThread， mAppThread是IApplicationThread的一个实例。
+
+ 
+
+[java] view plain copy
+ 
+android.ddm.DdmHandleAppName.setAppName("<pre-initialized>");            RuntimeInit.setApplicationObject(mAppThread.asBinder());            IActivityManager mgr = ActivityManagerNative.getDefault();            try {                mgr.attachApplication(mAppThread);            } catch (RemoteException ex) {            }  
+ 
+
+注意：每个应用程序对应着一个ActivityThread实例，应用程序由ActivityThread.main打开消息循环。每个应用程序同时也对应着一个ApplicationThread对象。该对象是activityThread和ActivityManagerService之间的桥梁。
+
+在attach中还做了一件事情，就是通过代理调用attachApplication，并利用binder的transact机制，在ActivityManagerService中建立了ProcessRecord信息。
+
+
+
+之后通过该ProcessRecord就可以获得该ActivityThread中的所有ActivityRecord记录。下面会介绍。
+
+ 
+
+ActivityManagerService:
+
+在ActivityManagerService中，也有一个用来管理activity的地方：mHistory栈，这个mHistory栈里存放的是服务端的activity记录HistoryActivity（class HistoryRecord extendsIApplicationToken.Stub）。处于栈顶的就是当前running状态的activity。
+
+我们来看一下Activity的startActivity方法的请求过程：
+
+
+
+从该时序图中可以看出，Activity.startActivity()方法最终是通过代理类和Binder机制，在ActivityManagerService.startActivity方法中执行的。
+
+那么在ActivityManagerService的startActivity中，主要做了那些事情？我们来看下里面比较重要的代码段：
+
+根据activity、ProcessRecord等信息创建HistoryRecord实例r
+[c-sharp] view plain copy
+ 
+HistoryRecord r = new HistoryRecord(this, callerApp, callingUid,intent, resolvedType, aInfo, mConfiguration,resultRecord, resultWho, requestCode, componentSpecified);  
+把r加入到mHistory中。
+[c-sharp] view plain copy
+ 
+mHistory.add(addPos, r);   
+activity被加入到mHistory之后，只是说明在服务端可以找到该activity记录了，但是在客户端目前还没有该activity记录。还需要通过ProcessRecord中的thread（IApplication）变量，调用它的scheduleLaunchActivity方法在ActivityThread中创建新的ActivityRecord记录（之前我们说过，客户端的activity是用ActivityRecord记录的，并放在mActivities中）。
+[c-sharp] view plain copy
+ 
+app.thread.scheduleLaunchActivity(new Intent(r.intent), r,System.identityHashCode(r),                    r.info, r.icicle, results, newIntents, !andResume,                    isNextTransitionForward());  
+涉及的主要类图：
+
+
+
+再来看下ApplicationThread中的scheduleLaunchActivity方法：
+
+ 
+
+[c-sharp] view plain copy
+ 
+public final void scheduleLaunchActivity(Intent intent, IBinder token, int ident,                ActivityInfo info, Bundle state, List<ResultInfo> pendingResults,                List<Intent> pendingNewIntents, boolean notResumed, boolean isForward) {            ActivityRecord r = new ActivityRecord();            r.token = token;            r.ident = ident;            r.intent = intent;            r.activityInfo = info;            r.state = state;            r.pendingResults = pendingResults;            r.pendingIntents = pendingNewIntents;            r.startsNotResumed = notResumed;            r.isForward = isForward;            queueOrSendMessage(H.LAUNCH_ACTIVITY, r);        }  
+ 
+
+在这个里面主要是根据服务端返回回来的信息创建客户端activity记录ActivityRecord. 并通过Handler发送消息到消息队列，进入消息循环。在ActivityThread.handleMessage()中处理消息。最终在handleLaunchActivity方法中把ActivityRecord记录加入到mActivities（mActivities.put(r.token,r)）中，并启动activity（涉及到window、view、windowManager，详情请看handleResumeActivity（）方法和上一篇关于window、WindowManager的介绍）
+
+ 
+
+总结：
+
+在客户端和服务端分别有一个管理activity的地方，服务端是在mHistory中，处于mHistory栈顶的就是当前处于running状态的activity，客户端是在mActivities中。
+在startActivity时，首先会在ActivityManagerService中建立HistoryRecord，并加入到mHistory中，然后通过scheduleLaunchActivity在客户端创建ActivityRecord记录并加入到mActivities中。最终在ActivityThread发起请求，进入消息循环，完成activity的启动和窗口的管理等
+from: http://blog.csdn.net/xieqibao/article/details/6570080
+文章乃参考、转载其他博客所得，仅供自己学习作笔记使用！！！
